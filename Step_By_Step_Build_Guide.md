@@ -161,66 +161,110 @@ class ScreenerState(TypedDict):
 
 ## Module 3: Core Tools
 
+All tools are implemented as **classes** for clean encapsulation, reusability, and easier testing.
+
 ### 3.1 `src/tools/pdf_parser.py`
-Extracts raw text from PDF resumes utilizing a fallback mechanism.
+Extracts raw text from PDF resumes using a multi-parser fallback strategy. The `PDFParser` class wraps three different PDF libraries and tries each one in order, returning the first result with meaningful content.
 ```python
-import fitz, pdfplumber, PyPDF2
+import fitz, pdfplumber
 from pathlib import Path
 
-def parse_pdf_pymupdf(path):
-    with fitz.open(path) as doc:
-        return chr(10).join([page.get_text() for page in doc])
+class PDFParser:
+    def __init__(self):
+        self.methods = {
+            'pymupdf': self.parse_pdf_pymupdf,
+            'pdfplumber': self.parse_pdf_pdfplumber,
+            'pypdf2': self.parse_pdf_pypdf2,
+        }
 
-def parse_pdf_pdfplumber(path):
-    with pdfplumber.open(path) as pdf:
-        return chr(10).join([p.extract_text() or '' for p in pdf.pages])
+    def parse_pdf_pymupdf(self, file_path: str) -> str:
+        text = ""
+        with fitz.open(file_path) as doc:
+            for page in doc:
+                text += page.get_text()
+        return text
 
-def parse_pdf_pypdf2(path):
-    from PyPDF2 import PdfReader
-    reader = PdfReader(path)
-    return chr(10).join([p.extract_text() or '' for p in reader.pages])
+    def parse_pdf_pdfplumber(self, file_path: str) -> str:
+        text = ""
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+        return text
 
-def parse_resume_pdf(path: str) -> tuple:
-    path = str(Path(path).resolve())
-    for name, fn in [('pymupdf', parse_pdf_pymupdf),
-                     ('pdfplumber', parse_pdf_pdfplumber),
-                     ('pypdf2', parse_pdf_pypdf2)]:
-        try:
-            text = fn(path)
-            if len(text.strip()) > 100:
-                return text, name
-        except Exception:
-            continue
-    raise ValueError(f'All PDF parsers failed for {path}')
+    def parse_pdf_pypdf2(self, file_path: str) -> str:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text
+
+    def parse_resume_pdf(self, file_path: str) -> str:
+        """Try each parser in order; return the first result with >100 chars."""
+        path = str(Path(file_path).resolve())
+        for name, fn in self.methods.items():
+            try:
+                text = fn(path)
+                if len(text.strip()) > 100:
+                    return text
+            except Exception:
+                continue
+        raise ValueError(f'All PDF parsers failed for {path}')
 ```
 
+**Key design decisions:**
+- Individual parsers **raise exceptions** on failure (no silent error strings) — error handling is centralized in `parse_resume_pdf`.
+- `self.methods` dict makes the parser list extensible — add a new parser and it's automatically included in the fallback chain.
+- Returns `str` (just the text), not a tuple — keeps downstream consumption simple.
+
 ### 3.2 `src/tools/vector_rag.py`
-Vector Retrieval using FAISS and HuggingFace chunks.
+Vector Retrieval using FAISS and HuggingFace embeddings. The `VectorRag` class initializes the text splitter and embedding model once, then reuses them across calls.
 ```python
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 
-def build_vector_index(resume_text: str):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=512, chunk_overlap=80,
-        separators=['\n\n', '\n', '. ', ' ', '']
-    )
-    chunks = splitter.split_text(resume_text)
-    docs = [Document(page_content=c, metadata={'chunk_id': i})
-            for i, c in enumerate(chunks)]
-    embeddings = HuggingFaceEmbeddings(
-        model_name='sentence-transformers/all-MiniLM-L6-v2',
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
-    )
-    return FAISS.from_documents(docs, embeddings)
 
-def retrieve_relevant_chunks(query: str, vector_store, k: int = 5):
-    results = vector_store.similarity_search(query, k=k)
-    return [doc.page_content for doc in results]
+class VectorRag:
+    def __init__(self, embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        self.embedding_model_name = embedding_model_name
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", ".", " "]
+        )
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=embedding_model_name,
+            model_kwargs={
+                'trust_remote_code': True
+            },
+            encode_kwargs={
+                'normalize_embeddings': True
+            }
+        )
+
+    def build_vector_index(self, resume_text: str):
+        """Split text into chunks, embed, and return a FAISS vector store."""
+        chunks = self.text_splitter.split_text(resume_text)
+        docs = [Document(page_content=c, metadata={'chunk_id': i})
+                for i, c in enumerate(chunks)]
+        return FAISS.from_documents(
+            documents=docs,
+            embedding=self.embeddings
+        )
+
+    def retrieve_relevant_chunks(self, query: str, vector_store, k: int = 5):
+        """Retrieve the top-k most similar chunks from the vector store."""
+        results = vector_store.similarity_search(query, k=k)
+        return [doc.page_content for doc in results]
 ```
+
+**Key design decisions:**
+- Embedding model and text splitter are initialized **once** in `__init__`, not on every call — avoids expensive re-loading.
+- `chunk_size=1000` with `chunk_overlap=200` gives good coverage for resume sections.
+- `normalize_embeddings=True` ensures cosine similarity works correctly.
 
 ### 3.3 `src/tools/pageindex_retriever.py`
 
@@ -360,28 +404,38 @@ def extract_technical_skills(tree: dict, llm=None) -> Dict[str, Any]:
 
 ### 4.1 `src/agents/init_node.py`
 Initializes both FAISS and PageIndex **once** so all downstream agents reuse them from state.
+Note how it instantiates the `PDFParser` and `VectorRag` classes, then calls their methods.
 ```python
-from src.tools.vector_rag import build_vector_index
+from src.tools.pdf_parser import PDFParser
+from src.tools.vector_rag import VectorRag
 from src.tools.pageindex_retriever import build_pageindex_tree
 from src.state.state import ScreenerState
 import logging
 
 logger = logging.getLogger(__name__)
 
+# Instantiate tool classes once at module level
+pdf_parser = PDFParser()
+vector_rag = VectorRag()
+
 def init_node(state: ScreenerState) -> dict:
+    # Parse the resume PDF (uses multi-parser fallback)
+    logger.info('Parsing resume PDF...')
+    resume_text = pdf_parser.parse_resume_pdf(state['resume_pdf_path'])
+
     # Build FAISS vector index from extracted resume text
     logger.info('Building FAISS vector index...')
-    vector_store = build_vector_index(state['resume_text'])
+    vector_store = vector_rag.build_vector_index(resume_text)
 
     # Build PageIndex JSON tree from the raw PDF file
-    # This calls VectifyAI's page_index_main() internally
     logger.info('Building PageIndex tree from PDF...')
     pageindex_tree = build_pageindex_tree(state['resume_pdf_path'])
 
     logger.info('Both indexes built and cached in state.')
     return {
+        'resume_text': resume_text,
         'vector_store': vector_store,
-        'pageindex_index': pageindex_tree,   # This is a JSON dict, not a live object
+        'pageindex_index': pageindex_tree,
     }
 ```
 
@@ -425,14 +479,17 @@ def router_node(state: ScreenerState) -> dict:
 
 ### 4.3 `src/agents/hybrid_agent.py`
 Runs **both** FAISS and PageIndex retrieval, then stores side-by-side comparison data.
+Uses the `VectorRag` class instance for vector retrieval.
 ```python
-from src.tools.vector_rag import retrieve_relevant_chunks
+from src.tools.vector_rag import VectorRag
 from src.tools.pageindex_retriever import pageindex_query
 from src.state.state import ScreenerState, RetrievalComparison
 
+vector_rag = VectorRag()
+
 def hybrid_agent_node(state: ScreenerState) -> dict:
     # Vector retrieval (semantic chunks)
-    vec_results = retrieve_relevant_chunks(
+    vec_results = vector_rag.retrieve_relevant_chunks(
         state['current_task'], state['vector_store'], k=4)
 
     # PageIndex retrieval (LLM reasons over the JSON tree)
